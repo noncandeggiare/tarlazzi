@@ -1,0 +1,14 @@
+{
+  "users": [
+    {
+      "user_id": 24643493,
+      "name": "Filippo",
+      "username": "filippo"
+    },
+    {
+      "user_id": 987654321,
+      "name": "Luigi Verdi",
+      "username": null
+    }
+  ]
+}
