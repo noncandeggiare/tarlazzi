@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from html import escape
 from datetime import datetime, timedelta
@@ -19,8 +20,10 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 DESCRIZIONE, DATA, ORA, CICLISTI, SELEZIONA_GARA_CONTEGGIO, SELEZIONA_GARA_SOLLECITA = range(6)
 CONFERMA_ELIMINA = 10
 
-# === CONFIGURAZIONE - DA MODIFICARE ===
-TOKEN = '1204096884:AAGFnc6tFireMOvl-axjf-IZr7A5OOWGz8g'  # Sostituisci con il token da @BotFather
+# === CONFIGURAZIONE ===
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not TOKEN:
+    raise RuntimeError("Imposta la variabile d'ambiente TELEGRAM_BOT_TOKEN")
 db = Database()
 messaggi_effimeri = {}
 
