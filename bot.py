@@ -882,7 +882,7 @@ async def invia_sollecito(chat_id: int, gara_id: int, bot):
         f"🚩 <b>{escape(gara[1])}</b>\n\n"
         "Devono ancora puntare:\n"
         f"{chr(10).join(menzioni)}\n\n"
-        f"Usa /punta per inserire la tua puntata entro le {scadenza}."
+        f"Usa /punta per inserire la tua puntata entro il {scadenza}."
     )
     await bot.send_message(chat_id, messaggio, parse_mode=ParseMode.HTML)
 
