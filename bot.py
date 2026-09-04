@@ -1,5 +1,6 @@
 import logging
 import re
+from html import escape
 from datetime import datetime, timedelta
 from collections import Counter
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -15,12 +16,13 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Stati per conversation handler
-DESCRIZIONE, DATA, ORA, CICLISTI, SELEZIONA_GARA_CONTEGGIO = range(5)
+DESCRIZIONE, DATA, ORA, CICLISTI, SELEZIONA_GARA_CONTEGGIO, SELEZIONA_GARA_SOLLECITA = range(6)
 CONFERMA_ELIMINA = 10
 
 # === CONFIGURAZIONE - DA MODIFICARE ===
 TOKEN = '1204096884:AAGFnc6tFireMOvl-axjf-IZr7A5OOWGz8g'  # Sostituisci con il token da @BotFather
 db = Database()
+messaggi_effimeri = {}
 
 # === FUNZIONI HELPER ===
 def nome_utente(update: Update) -> str:
@@ -57,20 +59,46 @@ async def invia_messaggio_effimero(bot, chat_id: int, user_id: int, text: str,
                                    reply_markup=None, callback_query_id=None,
                                    parse_mode=None):
     """Invia un messaggio visibile solo all'utente nel contesto del gruppo."""
-    return await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode=parse_mode,
-        api_kwargs={
-            "ephemeral_message_parameters": {
-                key: value for key, value in {
-                    "receiver_user_id": user_id,
-                    "callback_query_id": callback_query_id,
-                }.items() if value is not None
-            },
+    chiave = (chat_id, user_id)
+    await elimina_messaggi_effimeri(bot, chat_id, user_id)
+
+    dati = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup.to_dict() if reply_markup else None,
+        "parse_mode": parse_mode,
+        "ephemeral_message_parameters": {
+            key: value for key, value in {
+                "receiver_user_id": user_id,
+                "callback_query_id": callback_query_id,
+            }.items() if value is not None
         },
-    )
+    }
+    risposta = await bot._post("sendMessage", dati)
+    ephemeral_message_id = risposta.get("ephemeral_message_id")
+    if ephemeral_message_id is not None:
+        messaggi_effimeri[chiave] = [ephemeral_message_id]
+    else:
+        logger.warning("Telegram non ha restituito ephemeral_message_id per il messaggio effimero")
+    return risposta
+
+
+async def elimina_messaggi_effimeri(bot, chat_id: int, user_id: int):
+    """Elimina gli effimeri registrati per una chat e un utente."""
+    chiave = (chat_id, user_id)
+    precedenti = messaggi_effimeri.pop(chiave, [])
+    for ephemeral_message_id in precedenti:
+        try:
+            await bot._post(
+                "deleteEphemeralMessage",
+                {
+                    "chat_id": chat_id,
+                    "receiver_user_id": user_id,
+                    "ephemeral_message_id": ephemeral_message_id,
+                },
+            )
+        except Exception as error:
+            logger.warning("Impossibile rimuovere il messaggio effimero %s: %s", ephemeral_message_id, error)
 
 
 async def rispondi(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
@@ -132,6 +160,7 @@ async def configura_comandi(application):
         ('modifica', 'Modifica una puntata'),
         ('recap', 'Mostra il recap'),
         ('conteggio', 'Conta i ciclisti'),
+        ('sollecita', 'Sollecita chi non ha puntato'),
         ('aiuto', 'Mostra aiuto'),
         ('aggiungigara', 'Crea una gara'),
         ('eliminagara', 'Elimina una gara'),
@@ -176,6 +205,7 @@ async def aiuto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/eliminagara - Elimina una gara esistente\n"
         "/recap - Mostra il riepilogo delle puntate per le gare attive → notifica tutti!\n"
         "/conteggio - Conta quante volte ogni ciclista appare nelle puntate → notifica tutti!\n\n"
+        "/sollecita - Sollecita chi non ha ancora inserito una puntata\n\n"
         
         "<b>💡 Come funziona?</b>\n"
         "• Inserisci i ciclisti separati da spazio, ; oppure /\n"
@@ -194,6 +224,23 @@ async def aggiungi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await rispondi(update, context, "Inserisci la descrizione della gara:")
     return DESCRIZIONE
 
+
+def tastiera_date(oggi: str, domani: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Oggi", callback_data=f"data_oggi_{oggi}"),
+            InlineKeyboardButton("Domani", callback_data=f"data_domani_{domani}"),
+        ],
+        [InlineKeyboardButton("Altra data", callback_data="data_personalizzata")],
+    ])
+
+
+def tastiera_ore() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("14:00", callback_data="ora_14:00")],
+        [InlineKeyboardButton("Altro orario", callback_data="ora_personalizzata")],
+    ])
+
 async def ricevi_descrizione(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Salva la descrizione!
     context.user_data['descrizione'] = update.message.text.strip()
@@ -202,16 +249,46 @@ async def ricevi_descrizione(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Prosegui chiedendo la data
     oggi = datetime.now().strftime("%d/%m/%Y")
     domani = (datetime.now() + timedelta(days=1)).strftime("%d/%m/%Y")
-    reply_markup = ReplyKeyboardMarkup(
-        [[oggi, domani], ["Personalizzata"]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
     await rispondi(update, context,
-        "Scegli la data di scadenza oppure scrivila in formato GG/MM/AAAA:",
-        reply_markup=reply_markup,
+        "Scegli la data:",
+        reply_markup=tastiera_date(oggi, domani),
     )
     return DATA
+
+
+async def seleziona_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "data_personalizzata":
+        if update.effective_chat.type == 'private':
+            await query.edit_message_text("Scrivi la data in formato GG/MM/AAAA:")
+        else:
+            await invia_messaggio_effimero(
+                context.application.bot,
+                query.message.chat_id,
+                query.from_user.id,
+                "Scrivi la data in formato GG/MM/AAAA:",
+                callback_query_id=query.id,
+            )
+        return DATA
+
+    testo = query.data.rsplit("_", 1)[1]
+    data = datetime.strptime(testo, "%d/%m/%Y").date()
+    context.user_data['data'] = data
+    messaggio_ora = "Scegli l'ora di scadenza:"
+    if update.effective_chat.type == 'private':
+        await query.edit_message_text(messaggio_ora, reply_markup=tastiera_ore())
+    else:
+        await invia_messaggio_effimero(
+            context.application.bot,
+            query.message.chat_id,
+            query.from_user.id,
+            messaggio_ora,
+            reply_markup=tastiera_ore(),
+            callback_query_id=query.id,
+        )
+    return ORA
 
 async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     testo = update.message.text.strip()
@@ -220,7 +297,7 @@ async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Se utente sceglie "Personalizzata", chiedi di scrivere la data a mano
     if testo.lower().startswith("personal"):
-        await rispondi(update, context, "Scrivi la data in formato GG/MM/AAAA:", reply_markup=ReplyKeyboardRemove())
+        await rispondi(update, context, "Scrivi la data in formato GG/MM/AAAA", reply_markup=ReplyKeyboardRemove())
         return DATA  # Resta in questo stato
 
     # Tenta di interpretare la data
@@ -233,14 +310,60 @@ async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data['data'] = data
         await rispondi(update, context,
-            "Inserisci l'ora di scadenza in formato HH:MM (esempio: 14:00):",
-            reply_markup=ReplyKeyboardRemove(),
+            "Scegli l'ora di scadenza oppure scrivila in formato HH:MM:",
+            reply_markup=tastiera_ore(),
         )
         return ORA
 
     except ValueError:
         await rispondi(update, context, "Formato data non valido. Riprova con GG/MM/AAAA:", reply_markup=ReplyKeyboardRemove())
         return DATA
+
+
+async def seleziona_ora(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ora_personalizzata":
+        if update.effective_chat.type == 'private':
+            await query.edit_message_text("Scrivi l'ora in formato HH:MM:")
+        else:
+            await invia_messaggio_effimero(
+                context.application.bot,
+                query.message.chat_id,
+                query.from_user.id,
+                "Scrivi l'ora in formato HH:MM:",
+                callback_query_id=query.id,
+            )
+        return ORA
+
+    ora_input = query.data.rsplit("_", 1)[1]
+    data = context.user_data['data']
+    data_scadenza = datetime.combine(
+        data,
+        datetime.strptime(ora_input, "%H:%M").time(),
+    )
+
+    if data_scadenza < datetime.now():
+        messaggio = "Le 14:00 di oggi è già trascorsa. Scrivi un altro orario in formato HH:MM:"
+        if update.effective_chat.type == 'private':
+            await query.edit_message_text(messaggio)
+        else:
+            await invia_messaggio_effimero(
+                context.application.bot,
+                query.message.chat_id,
+                query.from_user.id,
+                messaggio,
+                callback_query_id=query.id,
+            )
+        return ORA
+
+    await finalizza_gara(
+        context,
+        get_chat_id_effettivo(update),
+        data_scadenza,
+    )
+    return ConversationHandler.END
 
 
 async def finalizza_gara(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
@@ -257,7 +380,12 @@ async def finalizza_gara(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         )
 
     fine_giornata = datetime.combine(data_scadenza.date(), datetime.max.time())
-    scheduler.add_job(elimina_gara_automatica, 'date', run_date=fine_giornata, args=[gara_id])
+    scheduler.add_job(
+        elimina_gara_automatica,
+        'date',
+        run_date=fine_giornata,
+        args=[context.application.bot, gara_id],
+    )
 
     testo = (
         f"✅ Gara aggiunta!\n\n"
@@ -265,7 +393,13 @@ async def finalizza_gara(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         f"⏰ Scadenza: {data_scadenza.strftime('%d/%m/%Y alle %H:%M')}\n"
         f"🗑️ Verrà eliminata automaticamente a fine giornata"
     )
-    if update and update.effective_chat.type == 'private':
+    if update and update.effective_chat.type != 'private':
+        await elimina_messaggi_effimeri(
+            context.application.bot,
+            chat_id,
+            update.effective_user.id,
+        )
+    if update and update.effective_chat.type == 'private' and update.message:
         await update.message.reply_text(
             testo,
             reply_markup=ReplyKeyboardRemove(),
@@ -304,6 +438,23 @@ async def ricevi_ora(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ORA
     
 # === COMANDO /eliminagara ===
+async def rimuovi_recap(bot, gara):
+    """Scollega e cancella il recap associato alla gara."""
+    message_id = gara[4]
+    if message_id is None:
+        return
+
+    try:
+        await bot.unpin_chat_message(gara[3], message_id)
+    except Exception as error:
+        logger.warning("Impossibile togliere il recap dai messaggi fissati: %s", error)
+
+    try:
+        await bot.delete_message(gara[3], message_id)
+    except Exception as error:
+        logger.warning("Impossibile cancellare il recap: %s", error)
+
+
 async def elimina_gara(update: Update, context: ContextTypes.DEFAULT_TYPE):
     registra_richiesta(update, 'eliminagara')
     chat_id = get_chat_id_effettivo(update)
@@ -324,6 +475,8 @@ async def elimina_gara(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await rispondi(update, context, text, reply_markup=keyboard)
             return CONFERMA_ELIMINA
         else:
+            gara = db.get_gara(gara_id)
+            await rimuovi_recap(context.application.bot, gara)
             db.elimina_gara(gara_id)
             await rispondi(update, context, f"✅ Gara eliminata: {gare[0][1]}")
             return ConversationHandler.END
@@ -355,6 +508,7 @@ async def elimina_gara_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return CONFERMA_ELIMINA
         else:
             gara = db.get_gara(gara_id)
+            await rimuovi_recap(context.application.bot, gara)
             db.elimina_gara(gara_id)
             logger.info("%s ha eliminato %s (id=%s)", nome_utente(update), gara[1], gara_id)
             await rispondi_callback(query, context, f"✅ {gara[1]} eliminata")
@@ -363,6 +517,7 @@ async def elimina_gara_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("conferma_elimina_"):
         gara_id = int(data.split("_")[2])
         gara = db.get_gara(gara_id)
+        await rimuovi_recap(context.application.bot, gara)
         db.elimina_gara(gara_id)
         logger.info("%s ha eliminato %s (id=%s)", nome_utente(update), gara[1], gara_id)
         await rispondi_callback(query, context, f"✅ {gara[1]} eliminata")
@@ -589,49 +744,142 @@ async def recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if len(gare) == 1:
-        await invia_recap(chat_id, gare[0][0], context.application.bot, update.message)
+        await invia_recap(
+            chat_id, gare[0][0], context.application.bot, update.message,
+            forza_nuovo=True,
+        )
         return
     
     for gara in gare:
         gara_id, descrizione, scadenza = gara
-        await invia_recap(chat_id, gara_id, context.application.bot, update.message)
+        await invia_recap(
+            chat_id, gara_id, context.application.bot, update.message,
+            forza_nuovo=True,
+        )
 
-async def invia_recap(chat_id: int, gara_id: int, bot, message=None):
+def testo_recap(gara, puntate) -> str:
+    recap_text = f"<b>• {escape(gara[1])} •</b>\n\n"
+
+    if not puntate:
+        return recap_text + "⚠️ Nessuna puntata ancora inserita."
+
+    for name, c1, c2, c3 in sorted(puntate, key=lambda puntata: puntata[0].casefold()):
+        recap_text += f"{escape(name)}: {escape(c1)}, {escape(c2)}, {escape(c3)}\n"
+    return recap_text
+
+
+async def invia_recap(chat_id: int, gara_id: int, bot, message=None, forza_nuovo=False):
     gara = db.get_gara(gara_id)
     puntate = db.get_puntate_gara(gara_id)
-    
-    recap_text = f"<b>• {gara[1]} •</b>\n\n"
-    
-    if not puntate:
-        recap_text += "⚠️ Nessuna puntata ancora inserita."
-    else:
-        for puntata in puntate:
-            name, c1, c2, c3 = puntata
-            recap_text += f"{name}: {c1}, {c2}, {c3}\n"
+    recap_text = testo_recap(gara, puntate)
     
     if message and message.chat.type == 'private':
         await message.reply_text(recap_text, parse_mode=ParseMode.HTML)
-    else:
-        sent_message = await bot.send_message(chat_id, recap_text, parse_mode=ParseMode.HTML)
-        logger.info("Recap inviato per gara id=%s nella chat %s", gara_id, chat_id)
-        
+        return
+    elif not forza_nuovo and gara[4]:
         try:
-            await bot.pin_chat_message(chat_id, sent_message.message_id, disable_notification=True)
-            db.update_message_id(gara_id, sent_message.message_id)
-        except Exception as e:
-            logger.error(f"Errore nel pinnare il messaggio: {e}")
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=gara[4],
+                text=recap_text,
+                parse_mode=ParseMode.HTML,
+            )
+            logger.info("Recap aggiornato per gara id=%s nella chat %s", gara_id, chat_id)
+            return
+        except Exception as error:
+            logger.warning("Impossibile aggiornare il recap esistente: %s", error)
 
-async def aggiorna_recap(chat_id: int, gara_id: int, bot):
-    gara = db.get_gara(gara_id)
-    
-    if gara[4]:
+    if forza_nuovo and gara[4]:
         try:
             await bot.unpin_chat_message(chat_id, gara[4])
             await bot.delete_message(chat_id, gara[4])
-        except:
-            pass
-    
+        except Exception as error:
+            logger.warning("Impossibile rimuovere il recap precedente: %s", error)
+
+    sent_message = await bot.send_message(chat_id, recap_text, parse_mode=ParseMode.HTML)
+    logger.info("Recap inviato per gara id=%s nella chat %s", gara_id, chat_id)
+
+    try:
+        await bot.pin_chat_message(chat_id, sent_message.message_id, disable_notification=True)
+        db.update_message_id(gara_id, sent_message.message_id)
+    except Exception as e:
+        logger.error(f"Errore nel pinnare il messaggio: {e}")
+
+
+async def aggiorna_recap(chat_id: int, gara_id: int, bot):
     await invia_recap(chat_id, gara_id, bot)
+
+
+# === COMANDO /sollecita ===
+async def sollecita(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    registra_richiesta(update, 'sollecita')
+    gare = db.get_gare_attive(get_chat_id_effettivo(update))
+
+    if not gare:
+        await rispondi(update, context, "⚠️ Nessuna gara attiva al momento.")
+        return ConversationHandler.END
+
+    if len(gare) == 1:
+        await elimina_messaggi_effimeri(
+            context.application.bot,
+            get_chat_id_effettivo(update),
+            update.effective_user.id,
+        )
+        await invia_sollecito(get_chat_id_effettivo(update), gare[0][0], context.application.bot)
+        return ConversationHandler.END
+
+    await rispondi(
+        update, context, "Seleziona la gara da sollecitare:",
+        reply_markup=genera_lista_gare(gare, "sollecita"),
+    )
+    return SELEZIONA_GARA_SOLLECITA
+
+
+async def seleziona_gara_sollecita(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    gara_id = int(query.data.split('_')[1])
+    await elimina_messaggi_effimeri(
+        context.application.bot,
+        query.message.chat_id,
+        query.from_user.id,
+    )
+    await invia_sollecito(query.message.chat_id, gara_id, context.application.bot)
+    await query.answer()
+    return ConversationHandler.END
+
+
+async def invia_sollecito(chat_id: int, gara_id: int, bot):
+    gara = db.get_gara(gara_id)
+    utenti_registrati = db.get_utenti_gruppo(chat_id)
+    if not utenti_registrati:
+        db.load_users_from_file(chat_id)
+        utenti_registrati = db.get_utenti_gruppo(chat_id)
+
+    user_ids_puntato = set(db.get_user_ids_che_hanno_puntato(gara_id))
+    utenti_mancanti = [utente for utente in utenti_registrati if utente[0] not in user_ids_puntato]
+    logger.info(
+        "Sollecito per gara id=%s (%s): utenti mancanti=%s",
+        gara_id,
+        gara[1],
+        ', '.join(display_name for _, display_name in utenti_mancanti) or 'nessuno',
+    )
+
+    if not utenti_mancanti:
+        await bot.send_message(chat_id, f"✅ Tutti gli utenti hanno già puntato per {gara[1]}")
+        return
+
+    menzioni = [
+        f'<a href="tg://user?id={user_id}">{escape(display_name)}</a>'
+        for user_id, display_name in utenti_mancanti
+    ]
+    scadenza = datetime.fromisoformat(str(gara[2])).strftime('%d/%m/%Y alle %H:%M')
+    messaggio = (
+        f"🚩 <b>{escape(gara[1])}</b>\n\n"
+        "Devono ancora puntare:\n"
+        f"{chr(10).join(menzioni)}\n\n"
+        f"Usa /punta per inserire la tua puntata entro le {scadenza}."
+    )
+    await bot.send_message(chat_id, messaggio, parse_mode=ParseMode.HTML)
 
 # === COMANDO /conteggio ===
 async def conteggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -645,7 +893,9 @@ async def conteggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(gare) == 1:
         gara_id = gare[0][0]
-        await mostra_conteggio(chat_id, gara_id, context.application.bot)
+        await mostra_conteggio(
+            chat_id, gara_id, context.application.bot, update.effective_user.id,
+        )
         return ConversationHandler.END
     
     reply_markup = genera_lista_gare(gare, "conteggio")
@@ -657,12 +907,17 @@ async def seleziona_gara_conteggio(update: Update, context: ContextTypes.DEFAULT
     gara_id = int(query.data.split('_')[1])
     logger.info("%s ha selezionato gara id=%s per il conteggio", nome_utente(update), gara_id)
     chat_id = get_chat_id_effettivo(update)
-    await mostra_conteggio(chat_id, gara_id, context.application.bot)
+    await mostra_conteggio(
+        chat_id, gara_id, context.application.bot, query.from_user.id,
+    )
     return ConversationHandler.END
 
-async def mostra_conteggio(chat_id: int, gara_id: int, bot):
+async def mostra_conteggio(chat_id: int, gara_id: int, bot, user_id: int | None = None):
     gara = db.get_gara(gara_id)
     ciclisti = db.get_tutti_ciclisti_gara(gara_id)
+
+    if user_id is not None:
+        await elimina_messaggi_effimeri(bot, chat_id, user_id)
     
     if not ciclisti:
         await bot.send_message(chat_id, "⚠️ Nessuna puntata ancora inserita per questa gara.")
@@ -711,7 +966,11 @@ async def invia_reminder(bot, chat_id: int, gara_id: int):
     logger.info("Reminder inviato per gara id=%s nella chat %s", gara_id, chat_id)
 
 # === ELIMINAZIONE AUTOMATICA ===
-def elimina_gara_automatica(gara_id: int):
+def elimina_gara_automatica(bot, gara_id: int):
+    gara = db.get_gara(gara_id)
+    if gara:
+        import asyncio
+        asyncio.run(rimuovi_recap(bot, gara))
     db.elimina_gara(gara_id)
     logger.info(f"Gara {gara_id} eliminata automaticamente")
 
@@ -736,9 +995,11 @@ def main():
     states={
         DESCRIZIONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_descrizione)],
         DATA: [
+            CallbackQueryHandler(seleziona_data, pattern='^data_'),
             MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data),
         ],
         ORA: [
+            CallbackQueryHandler(seleziona_ora, pattern='^ora_'),
             MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_ora),
         ],
     },
@@ -788,12 +1049,24 @@ def main():
         },
         fallbacks=[CommandHandler('cancella', cancella)]
     )
+
+    conv_sollecita = ConversationHandler(
+        entry_points=[CommandHandler('sollecita', sollecita)],
+        allow_reentry=True,
+        states={
+            SELEZIONA_GARA_SOLLECITA: [
+                CallbackQueryHandler(seleziona_gara_sollecita, pattern='^sollecita_')
+            ],
+        },
+        fallbacks=[CommandHandler('cancella', cancella)]
+    )
     
     application.add_handler(conv_aggiungi)
     application.add_handler(conv_elimina)
     application.add_handler(conv_punta)
     application.add_handler(conv_modifica)
     application.add_handler(conv_conteggio)
+    application.add_handler(conv_sollecita)
     application.add_handler(CommandHandler('recap', recap))
     application.add_handler(CommandHandler('eliminagara', elimina_gara))
     application.add_handler(CallbackQueryHandler(elimina_gara_callback, pattern="^elimina_"))
