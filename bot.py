@@ -4,6 +4,7 @@ import re
 from html import escape
 from datetime import datetime, timedelta
 from collections import Counter
+from dotenv import load_dotenv
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from telegram.constants import ParseMode
@@ -21,6 +22,7 @@ DESCRIZIONE, DATA, ORA, CICLISTI, SELEZIONA_GARA_CONTEGGIO, SELEZIONA_GARA_SOLLE
 CONFERMA_ELIMINA = 10
 
 # === CONFIGURAZIONE ===
+load_dotenv()
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN:
     raise RuntimeError("Imposta la variabile d'ambiente TELEGRAM_BOT_TOKEN")
